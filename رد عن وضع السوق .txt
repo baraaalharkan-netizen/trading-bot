@@ -1,0 +1,73 @@
+
+
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+import yfinance as yf
+
+TOKEN = "8984356059:AAF4F01dJ11V7XBnYObL5Anslo_OUwNfNgE "
+
+def get_market_summary():
+    spy = yf.Ticker("SPY")
+    qqq = yf.Ticker("QQQ")
+    vix = yf.Ticker("^VIX")
+
+    spy_price = spy.history(period="2d")["Close"]
+    qqq_price = qqq.history(period="2d")["Close"]
+    vix_price = vix.history(period="1d")["Close"]
+
+    spy_change = ((spy_price.iloc[-1] - spy_price.iloc[-2]) / spy_price.iloc[-2]) * 100
+    qqq_change = ((qqq_price.iloc[-1] - qqq_price.iloc[-2]) / qqq_price.iloc[-2]) * 100
+
+    vix_value = float(vix_price.iloc[-1])
+
+    if spy_change > 0.5:
+        sentiment = "🟢 إيجابي"
+    elif spy_change < -0.5:
+        sentiment = "🔴 سلبي"
+    else:
+        sentiment = "🟡 محايد"
+
+    return f"""
+📊 ملخص السوق الأمريكي
+
+SPY: {spy_change:.2f}%
+QQQ: {qqq_change:.2f}%
+VIX: {vix_value:.2f}
+
+التقييم العام: {sentiment}
+"""
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "أرسل: وضع السوق"
+    )
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.lower()
+
+    if "وضع السوق" in text:
+        summary = get_market_summary()
+        await update.message.reply_text(summary)
+
+    elif text == "spy":
+        spy = yf.Ticker("SPY")
+        price = spy.history(period="1d")["Close"].iloc[-1]
+        await update.message.reply_text(f"سعر SPY الحالي: {price:.2f}")
+
+    elif text == "vix":
+        vix = yf.Ticker("^VIX")
+        value = vix.history(period="1d")["Close"].iloc[-1]
+        await update.message.reply_text(f"VIX الحالي: {value:.2f}")
+
+async def main():
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    print("Bot Started...")
+    await app.run_polling()
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
