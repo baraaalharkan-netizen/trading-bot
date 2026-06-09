@@ -1,0 +1,225 @@
+
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import requests
+from datetime import datetime, timedelta
+import pytz
+
+# ═══════════════════════════════════════════
+#  ⚙️ إعداداتك — غيّر هذين السطرين فقط
+# ═══════════════════════════════════════════
+TELEGRAM_TOKEN   = "8984356059:AAF4F01dJ11V7XBnYObL5Anslo_OUwNfNgE "
+TELEGRAM_CHAT_ID = "5351576642"
+
+# ═══════════════════════════════════════════
+#  إعدادات ثابتة — ما تحتاج تغيرها
+# ═══════════════════════════════════════════
+SYMBOL           = "SPY"
+EMA_FAST         = 9
+EMA_SLOW         = 21
+RSI_PERIOD       = 14
+MACD_FAST        = 12
+MACD_SLOW        = 26
+MACD_SIG         = 9
+VOL_MULT         = 1.2
+
+# إعدادات الخيارات
+OTM_CALL_PCT     = 0.02    # Call أعلى من السعر بـ 2%
+OTM_PUT_PCT      = 0.02    # Put أقل من السعر بـ 2%
+DAYS_TO_EXPIRY   = 30      # شهري
+
+
+# ═══════════════════════════════════════════
+#  إرسال تيليغرام
+# ═══════════════════════════════════════════
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        r = requests.post(url, json={
+            "chat_id":    TELEGRAM_CHAT_ID,
+            "text":       msg,
+            "parse_mode": "HTML"
+        }, timeout=10)
+        print("✅ تم الإرسال لتيليغرام")
+    except Exception as e:
+        print(f"❌ خطأ في تيليغرام: {e}")
+
+
+# ═══════════════════════════════════════════
+#  تحميل البيانات وحساب المؤشرات
+# ═══════════════════════════════════════════
+def fetch_and_analyze():
+    # تحميل البيانات
+    df = yf.download(SYMBOL, period="60d", interval="1h",
+                     auto_adjust=True, progress=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.droplevel(1)
+
+    # المؤشرات
+    df["EMA_fast"] = df["Close"].ewm(span=EMA_FAST, adjust=False).mean()
+    df["EMA_slow"] = df["Close"].ewm(span=EMA_SLOW, adjust=False).mean()
+
+    delta    = df["Close"].diff()
+    avg_gain = delta.clip(lower=0).ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
+    avg_loss = (-delta.clip(upper=0)).ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
+    df["RSI"] = 100 - (100 / (1 + avg_gain / avg_loss))
+
+    df["MACD"]     = df["Close"].ewm(span=MACD_FAST, adjust=False).mean() - \
+                     df["Close"].ewm(span=MACD_SLOW, adjust=False).mean()
+    df["MACD_sig"] = df["MACD"].ewm(span=MACD_SIG, adjust=False).mean()
+    df["Vol_avg"]  = df["Volume"].rolling(20).mean()
+    df.dropna(inplace=True)
+
+    row  = df.iloc[-1]
+    prev = df.iloc[-2]
+    price = float(row["Close"])
+    rsi   = float(row["RSI"])
+    macd  = float(row["MACD"])
+    msig  = float(row["MACD_sig"])
+    ef    = float(row["EMA_fast"])
+    es    = float(row["EMA_slow"])
+    vol   = float(row["Volume"])
+    vavg  = float(row["Vol_avg"])
+
+    # قوة الإشارة (1-3 نجوم)
+    def signal_strength(conditions_met):
+        if conditions_met >= 4: return "⭐⭐⭐ قوية جداً"
+        if conditions_met >= 3: return "⭐⭐ متوسطة"
+        return "⭐ ضعيفة"
+
+    # ═══════ إشارة CALL (صعود) ═══════
+    call_conditions = [
+        ef > es,                          # EMA صاعد
+        float(prev["EMA_fast"]) <= float(prev["EMA_slow"]),  # تقاطع جديد
+        rsi < 50,                          # RSI ليس مشبع
+        macd > msig,                       # MACD إيجابي
+        vol > vavg * VOL_MULT             # سيولة عالية
+    ]
+    call_score = sum(call_conditions)
+    call_signal = call_score >= 3
+
+    # ═══════ إشارة PUT (نزول) ═══════
+    put_conditions = [
+        ef < es,                           # EMA هابط
+        float(prev["EMA_fast"]) >= float(prev["EMA_slow"]),  # تقاطع جديد
+        rsi > 55,                          # RSI مرتفع
+        macd < msig,                       # MACD سلبي
+        vol > vavg * VOL_MULT             # سيولة عالية
+    ]
+    put_score = sum(put_conditions)
+    put_signal = put_score >= 3
+
+    # ═══════ ترشيح الخيارات ═══════
+    # تاريخ الانتهاء — أقرب جمعة بعد 30 يوم
+    target_date = datetime.now() + timedelta(days=DAYS_TO_EXPIRY)
+    while target_date.weekday() != 4:  # 4 = جمعة
+        target_date += timedelta(days=1)
+    expiry = target_date.strftime("%Y-%m-%d")
+
+    # Strike Price
+    call_strike = round(price * (1 + OTM_CALL_PCT) / 5) * 5  # أقرب مضاعف لـ 5
+    put_strike  = round(price * (1 - OTM_PUT_PCT)  / 5) * 5
+
+    return {
+        "price":        round(price, 2),
+        "rsi":          round(rsi, 1),
+        "macd":         round(macd, 3),
+        "macd_sig":     round(msig, 3),
+        "ema_fast":     round(ef, 2),
+        "ema_slow":     round(es, 2),
+        "vol_high":     vol > vavg * VOL_MULT,
+        "call_signal":  call_signal,
+        "call_score":   call_score,
+        "call_strength": signal_strength(call_score),
+        "put_signal":   put_signal,
+        "put_score":    put_score,
+        "put_strength": signal_strength(put_score),
+        "call_strike":  call_strike,
+        "put_strike":   put_strike,
+        "expiry":       expiry,
+    }
+
+
+# ═══════════════════════════════════════════
+#  بناء الرسالة
+# ═══════════════════════════════════════════
+def build_message(s):
+    now = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d %H:%M")
+
+    # تقييم كل مؤشر بشكل منفصل للـ CALL
+    ema_call   = "✅ يدعم CALL"  if s["ema_fast"] > s["ema_slow"]  else "❌ لا يدعم CALL"
+    rsi_call   = "✅ يدعم CALL"  if s["rsi"] < 50                  else "❌ لا يدعم CALL"
+    macd_call  = "✅ يدعم CALL"  if s["macd"] > s["macd_sig"]      else "❌ لا يدعم CALL"
+    vol_call   = "✅ سيولة عالية" if s["vol_high"]                  else "⚠️ سيولة منخفضة"
+
+    # تقييم كل مؤشر بشكل منفصل للـ PUT
+    ema_put    = "✅ يدعم PUT"   if s["ema_fast"] < s["ema_slow"]  else "❌ لا يدعم PUT"
+    rsi_put    = "✅ يدعم PUT"   if s["rsi"] > 55                  else "❌ لا يدعم PUT"
+    macd_put   = "✅ يدعم PUT"   if s["macd"] < s["macd_sig"]      else "❌ لا يدعم PUT"
+
+    # تفصيل المؤشرات
+    indicators = (
+        f"\n📊 <b>تفصيل المؤشرات:</b>\n"
+        f"  EMA 9/21 : {ema_call} / {ema_put}\n"
+        f"  RSI ({s['rsi']}): {rsi_call} / {rsi_put}\n"
+        f"  MACD     : {macd_call} / {macd_put}\n"
+        f"  Volume   : {vol_call}"
+    )
+
+    if s["call_signal"] and not s["put_signal"]:
+        header = "📈 <b>المؤشرات تنفع CALL ✅</b>"
+        option_section = (
+            f"\n🟢 <b>الخيار المقترح:</b>\n"
+            f"  • النوع: <b>CALL</b>\n"
+            f"  • Strike Price: <b>${s['call_strike']}</b>\n"
+            f"  • تاريخ الانتهاء: <b>{s['expiry']}</b>\n"
+            f"  • قوة الإشارة: {s['call_strength']}\n"
+            f"  • هدف الربح: <b>${round(s['price']*1.04, 2)}</b>\n"
+            f"  • وقف الخسارة: <b>${round(s['price']*0.98, 2)}</b>"
+        )
+
+    elif s["put_signal"] and not s["call_signal"]:
+        header = "📉 <b>المؤشرات تنفع PUT ✅</b>"
+        option_section = (
+            f"\n🔴 <b>الخيار المقترح:</b>\n"
+            f"  • النوع: <b>PUT</b>\n"
+            f"  • Strike Price: <b>${s['put_strike']}</b>\n"
+            f"  • تاريخ الانتهاء: <b>{s['expiry']}</b>\n"
+            f"  • قوة الإشارة: {s['put_strength']}\n"
+            f"  • هدف الربح: <b>${round(s['price']*0.96, 2)}</b>\n"
+            f"  • وقف الخسارة: <b>${round(s['price']*1.02, 2)}</b>"
+        )
+
+    elif s["call_signal"] and s["put_signal"]:
+        header = "⚠️ <b>المؤشرات متضاربة — انتظر</b>"
+        option_section = "\n⏸ لا CALL ولا PUT الحين، أفضل تنتظر"
+
+    else:
+        header = "⏸ <b>المؤشرات محايدة — لا إشارة</b>"
+        option_section = "\n📊 لا CALL ولا PUT — السوق غير واضح"
+
+    msg = (
+        f"{header}\n"
+        f"🕐 {now} (نيويورك)\n"
+        f"{'─'*28}\n"
+        f"💵 <b>سعر SPY:</b> ${s['price']}\n"
+        f"{option_section}\n"
+        f"{'─'*28}"
+        f"{indicators}\n"
+        f"{'─'*28}\n"
+        f"⚡️ نفّذ في <b>دراية جلوبل</b> يدوياً\n"
+        f"⚠️ إشارات تحليلية فقط، ليست توصية مالية"
+    )
+    return msg
+
+
+# ═══════════════════════════════════════════
+#  التشغيل
+# ═══════════════════════════════════════════
+print("🔍 جاري تحليل SPY...")
+signal = fetch_and_analyze()
+msg    = build_message(signal)
+print(msg)
+send_telegram(msg)
